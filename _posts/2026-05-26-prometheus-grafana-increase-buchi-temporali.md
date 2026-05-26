@@ -1,121 +1,105 @@
-# Prometheus & Grafana — attenzione ai “buchi” temporali con `increase()`
+# Problemi con `increase()` in Prometheus/Grafana e buchi temporali dopo i redeploy
 
-Breve post su Prometheus/Grafana riguardo ad un problema con cui mi sono scontrato ultimamente.
+Breve post su un problema con cui mi sono scontrato recentemente utilizzando **Prometheus**, **PromQL** e **Grafana**.
 
 ---
 
-## Il problema
+# Il problema
 
-Per estrarre i numeri normalmente tramite PromQL nelle dashboard di Grafana utilizziamo la funzione `increase()`:
+Per estrarre i numeri nelle dashboard Grafana, normalmente utilizziamo la funzione `increase()` di PromQL, che rappresenta il delta del contatore all'interno della finestra temporale selezionata.
+
+## Esempio
 
 ```promql
 sum by(client_name) (
   increase(
-    files_input_counter{
-      client_name=~"$ClientName",
-      ...tags vari...
-    }[$__range]
+    files_input_counter(client_name=~"$ClientName", ....tags vari..}[$__range]
   )
 )
 ```
 
-Il parametro `__$range` ci permette di ottenere il delta tra il valore assunto dal contatore ad inizio e fine intervallo temporale.
+La variabile `$__range` permette di ottenere il delta tra il valore assunto dal contatore a inizio e fine intervallo temporale.
 
 ---
 
-## Il limite di `increase()`
+# Attenzione ai "buchi temporali"
 
-La funzione `increase()`, pur gestendo i **counter resets**, ha un grosso limite (come molte altre funzioni PromQL):
+La funzione `increase()`, pur gestendo correttamente i **counter reset**, ha un grosso limite, come molte altre funzioni PromQL:
 
-- ha bisogno di **almeno 2 campioni**
-- non funziona correttamente in presenza di **buchi temporali**
+- ha bisogno di almeno **2 campioni**
+- non funziona correttamente in presenza di **buchi temporali** all'interno della finestra di analisi
 
-Quando parlo di *buchi* su Prometheus, intendo situazioni in cui Prometheus ha eseguito almeno uno scrape mentre il microservizio non esponeva alcuna metrica.
+Quando parlo di "buchi", intendo situazioni in cui Prometheus ha effettuato uno scrape mentre il microservizio non esponeva alcuna metrica.
 
 Questo può capitare, ad esempio:
 
-- dopo un riavvio del microservizio
-- durante un deploy Kubernetes
-- durante una fase di startup in cui le metriche non sono ancora disponibili
+- dopo un restart
+- durante un redeploy Kubernetes
+- in fase di startup del microservizio
 
 ---
 
-## Cosa succede nel concreto?
+# Il caso reale
 
-Nel nostro caso ci siamo accorti che i conteggi su Grafana erano sempre corretti…
+Nel nostro caso i conteggi Grafana risultavano sempre corretti...
 
-**tranne dopo un redeploy del microservizio.**
+tranne durante i redeploy.
 
-Il motivo era proprio il “buco” temporale privo di dati.
+Il motivo era proprio il buco temporale privo di dati su Prometheus.
 
-Questo comportamento è spesso accettabile in sistemi *always-on* con traffico continuo, ma diventa molto problematico in sistemi batch/scheduler-based.
+Questo problema è spesso trascurabile nei sistemi **always-on** con traffico continuo, ma nel nostro scenario era molto penalizzante.
 
-Nel nostro caso:
+## Perché?
 
-- il sistema può rimanere fermo per minuti
-- viene attivato tramite scheduler Spring
-- può processare centinaia di file in pochi secondi
+Perché il nostro microservizio:
 
----
+- resta inattivo anche per diversi minuti
+- viene attivato tramite Spring Scheduler
+- può processare moltissimi file in pochissimo tempo
 
-## Esempio reale
+Quindi può succedere questo scenario:
 
-Supponiamo che:
+1. il microservizio viene riavviato
+2. Prometheus esegue uno scrape durante il periodo "vuoto"
+3. il servizio processa improvvisamente 200 file
+4. Prometheus vede solo il valore finale `200`
 
-- prima del deploy non esista alcun campione
-- dopo il restart il microservizio processi subito **200 file**
-- Prometheus veda soltanto:
+Risultato:
 
-```text
-files_input_counter = 200
+```promql
+increase(...)
 ```
 
-In questo scenario `increase()` può restituire:
-
-```text
-0
-```
-
-Perché?
-
-Perché manca il campione precedente necessario per calcolare il delta.
+restituisce `0`, perché manca il campione precedente necessario per il calcolo del delta.
 
 ---
 
-# Possibili soluzioni
+# Soluzione 1 - Inizializzare le serie temporali all'avvio
 
-Esistono principalmente due approcci.
+La prima soluzione consiste nell'inizializzare a zero tutte le possibili serie temporali durante lo startup del microservizio.
 
----
+## Concetto
 
-# Soluzione 1 — inizializzare le serie temporali a zero
+Occorre:
 
-La soluzione che ho adottato consiste nel:
+1. creare i contatori a zero
+2. attendere che Prometheus effettui almeno uno scrape
+3. solo dopo iniziare il processing reale
 
-1. inizializzare a zero tutte le possibili serie temporali all’avvio di Spring Boot
-2. attendere abbastanza tempo affinché Prometheus effettui almeno uno scrape
-3. soltanto dopo iniziare il vero processing
-
-In questo modo esisteranno già due campioni:
-
-- il primo a zero
-- il secondo con il valore reale
-
-e `increase()` potrà funzionare correttamente fin dal primo incremento utile.
+In questo modo esisterà già un campione iniziale pari a `0`, permettendo a `increase()` di funzionare correttamente già dal primo incremento reale.
 
 ---
 
-## Nel mio caso
+# Esempio Spring Scheduler
 
-Ho introdotto un `initialDelay` nello scheduler Spring:
+Nel mio caso ho introdotto semplicemente un delay iniziale di 60 secondi:
 
 ```java
 @Service
 public class FileSchedulerService {
 
     @Scheduled(
-        initialDelayString =
-            "${mio-microservizio.sftp.scheduler.initial-delay}"
+        initialDelayString = "${mio-microservizio.sftp.scheduler.initial-delay}"
     )
     public void schedulerInputDirectory() {
 
@@ -123,103 +107,100 @@ public class FileSchedulerService {
 }
 ```
 
-Nel mio caso un delay di circa **60 secondi** si è dimostrato sufficiente.
+Questa è la soluzione che ho adottato e si è dimostrata funzionare perfettamente.
 
 ---
 
-# Quando questa soluzione funziona bene?
+# Limite della soluzione
 
-Funziona bene quando conosciamo a priori tutti i possibili valori delle labels.
+Questa soluzione funziona bene solo se conosciamo a priori tutti i possibili valori delle labels.
 
-Ad esempio:
+## Esempio
 
-- tag `client_name`
+Supponiamo di avere:
+
+### Labels disponibili
+
+- `client_name`
   - mario
   - luca
 
-- tag `file_extension`
-  - `.txt`
-  - `.csv`
+- `file_extension`
+  - .txt
+  - .csv
 
-Possiamo inizializzare le metriche così:
+Possiamo quindi inizializzare le metriche così:
 
 ```text
-files_input_counter{client_name="mario",file_extension=".txt"} 0
-files_input_counter{client_name="mario",file_extension=".csv"} 0
-files_input_counter{client_name="luca",file_extension=".txt"} 0
-files_input_counter{client_name="luca",file_extension=".csv"} 0
+files_input_counter{client_name="mario",file_extension=".txt"} 0.0
+files_input_counter{client_name="mario",file_extension=".csv"} 0.0
+files_input_counter{client_name="luca",file_extension=".txt"} 0.0
+files_input_counter{client_name="luca",file_extension=".csv"} 0.0
 ```
 
 ---
 
-## Limite di questo approccio
+# Quando questa soluzione NON è applicabile
 
-Questa soluzione NON è applicabile quando:
+Se non conosciamo in anticipo i valori delle labels, questa tecnica diventa poco praticabile.
 
-- non conosciamo in anticipo i valori delle labels
-- le combinazioni possibili sono dinamiche
-- le cardinalità sono elevate
+Ad esempio:
 
-In questi casi consiglio il secondo approccio.
+- nomi clienti dinamici
+- identificativi variabili
+- labels generate runtime
 
----
-
-# Soluzione 2 — usare Prometheus Pushgateway
-
-L’alternativa consiste nell’utilizzare un:
-
-# Prometheus Pushgateway
-
-Invece di esporre le metriche tramite l’endpoint management del microservizio:
-
-- il microservizio esegue una **push**
-- i contatori vengono salvati nel Pushgateway
-- Prometheus scraperà sempre il Pushgateway
+In questi casi consiglio la seconda soluzione.
 
 ---
 
-## Vantaggi
+# Soluzione 2 - Utilizzare Pushgateway
 
-Con questo approccio:
+L'alternativa consiste nell'utilizzare un **Prometheus Pushgateway**.
 
-- il restart del microservizio non azzera nulla
-- non esistono più buchi temporali
-- i contatori restano persistenti
-- `increase()` continua a funzionare correttamente
+In questo scenario:
 
-Anche se il microservizio è momentaneamente fermo:
+- il microservizio non espone direttamente le metriche
+- i contatori vengono pushati verso Pushgateway
+- Pushgateway mantiene i valori anche durante i restart del servizio
 
-- il valore rimane stabile
-- ma non scompare mai
+## Vantaggio principale
+
+Quando il microservizio si riavvia:
+
+- Pushgateway continua a mantenere le metriche precedenti
+- Prometheus non vede buchi temporali
+- il contatore resta fermo all'ultimo valore noto
+
+Quindi `increase()` continua a funzionare correttamente.
 
 ---
 
-# Quando Pushgateway è particolarmente adatto?
+# Quando Pushgateway è particolarmente indicato
 
-Il pattern Pushgateway è molto usato quando il deploy avviene tramite:
+La soluzione con Pushgateway è particolarmente adatta quando il microservizio è in realtà un:
 
-- Kubernetes Jobs
-- batch temporanei
-- processi short-lived
+- Kubernetes Job
+- batch temporaneo
+- processo schedulato che si avvia e termina
 
-ovvero servizi che:
+In questi casi il pattern corretto è:
 
-1. si avviano
-2. eseguono il job
-3. terminano
-
-In questo scenario il concetto di “push finale” verso Pushgateway è perfettamente naturale.
+1. il job parte
+2. esegue il processing
+3. invia le metriche tramite PUSH
+4. termina
 
 ---
 
 # Considerazione finale
 
-Probabilmente il nostro microservizio batch avrebbe potuto essere progettato fin dall’inizio come Kubernetes Job.
+Probabilmente il nostro microservizio avrebbe dovuto essere concepito come un vero job batch fin dall'inizio.
 
-Tuttavia l’architettura era già consolidata come servizio always-on, quindi ho preferito applicare la soluzione 1:
+Tuttavia l'architettura era già stata definita, quindi ho preferito:
 
-- inizializzazione delle serie temporali
-- delay iniziale dello scheduler
-- mantenimento del microservizio sempre attivo
+- mantenere il servizio always-on
+- applicare la soluzione 1
+- introdurre un delay iniziale per permettere a Prometheus di creare le serie temporali
 
-e nel nostro caso il risultato si è dimostrato affidabile e stabile.
+Nel nostro caso questa soluzione si è dimostrata semplice, efficace e sufficiente.
